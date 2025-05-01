@@ -1,0 +1,7 @@
+*.pyc
+__pycache__/
+.venv/
+data/specs/*
+data/annotations/*
+*.pdf 
+PRD.md
