@@ -3,12 +3,13 @@ pypdf2==3.0.1  # PDF text extraction and manipulation
 
 # RAG and Vector Database
 langchain==0.3.0  # Framework for building LLM applications
+langchain-community==0.3.0  # Community-maintained LangChain integrations
+langchain-text-splitters==0.3.8  # Text splitting utilities
 faiss-cpu==1.8.0  # Efficient similarity search and clustering of dense vectors
 sentence-transformers==3.1.1  # State-of-the-art sentence embeddings
 
-# Language Models
-transformers==4.44.2  # State-of-the-art NLP models and tokenizers
-langchain-community==0.3.0  # Community-maintained LangChain integrations
+# LLM Integration
+langchain-ollama==0.3.2  # Ollama integration for LangChain
 
 # API and HTTP
 requests==2.32.3  # HTTP library for API calls 
