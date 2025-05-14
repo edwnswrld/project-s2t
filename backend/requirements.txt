@@ -5,6 +5,7 @@ pypdf2==3.0.1  # PDF text extraction and manipulation
 langchain==0.3.0  # Framework for building LLM applications
 langchain-community==0.3.0  # Community-maintained LangChain integrations
 langchain-text-splitters==0.3.8  # Text splitting utilities
+langchain-huggingface==0.2.0  # HuggingFace integration for LangChain
 faiss-cpu==1.8.0  # Efficient similarity search and clustering of dense vectors
 sentence-transformers==3.1.1  # State-of-the-art sentence embeddings
 

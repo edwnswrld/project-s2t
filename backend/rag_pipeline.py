@@ -6,23 +6,106 @@ import json
 import re
 import os
 from langchain_text_splitters.character import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.llms import Ollama
-from langchain.callbacks.manager import CallbackManager
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
 import requests
 import torch
 
+#this class is used to extract requirements from a text file
+class PRDExtractor:
+    def __init__(self):
+        self.section_patterns = [
+            r'\d+\.\d+\s*Hardware\s*Requirements',
+            r'\d+\.\d+\s*Software\s*Requirements',
+            r'Technical\s*Requirements'
+        ]
+        self.requirement_patterns = [
+            r'^(?P<id>[A-Z]{2}\d+)\s+(?P<req>.+?)\s+(?P<pri>High|Medium|Low)\s+(?P<notes>.+)$',
+            r'^-\s*(?P<req>.+?)\s*:\s*(?P<notes>.+)$',
+            r'^(?:The system shall|Must|Should)\s+(?P<req>.+?)(?:\s*\((?P<notes>.+)\))?$'
+        ]
+
+    def extract_requirements_from_text(self, text: str) -> List[Dict[str, str]]:
+        """Extract requirements from text using the defined patterns.
+        
+        Args:
+            text: The text to extract requirements from
+            
+        Returns:
+            List of dictionaries containing requirement information
+        """
+        requirements = []
+        
+        # Split text into lines
+        lines = text.split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Try each pattern
+            for pattern in self.requirement_patterns:
+                match = re.match(pattern, line)
+                if match:
+                    req_dict = match.groupdict()
+                    # Ensure all required fields are present
+                    if 'id' not in req_dict:
+                        req_dict['id'] = ''
+                    if 'priority' not in req_dict:
+                        req_dict['priority'] = 'Medium'
+                    if 'notes' not in req_dict:
+                        req_dict['notes'] = ''
+                    requirements.append(req_dict)
+                    break
+        
+        return requirements
+
 def clean_text(text: str) -> str:
-    """Clean text by removing extra whitespace and newlines."""
-    # Replace multiple newlines and spaces with single ones
-    text = re.sub(r'\s+', ' ', text)
+    """Clean text by removing extra whitespace and newlines while preserving tabs."""
+    # Replace multiple newlines and spaces with single ones, but preserve tabs
+    text = re.sub(r'[ \n]+', ' ', text)
     # Remove markdown formatting
     text = re.sub(r'\*\*|__', '', text)
     # Remove special characters but keep basic punctuation
-    text = re.sub(r'[^\w\s.,!?-]', '', text)
+    text = re.sub(r'[^\w\s.,!?\t-]', '', text)
     return text.strip()
+
+def format_requirement_to_sentence(req: Dict[str, str]) -> str:
+    """Convert structured requirement to natural language sentence.
+    
+    Args:
+        req: Dictionary containing requirement fields (id, requirement, priority, notes)
+        
+    Returns:
+        Formatted requirement as a natural language sentence
+    """
+    # First normalize whitespace
+    line = ' '.join(line.split())
+    
+    # Handle both "HW1 Desc Priority Notes" and "ID   Requirement   Priority   Notes" formats
+    parts = re.split(r'\s{2,}|\t', line)  # Split on multiple spaces or tabs
+    
+    if len(parts) >= 4:  # Full format
+        req_id, desc, priority, notes = parts[0], ' '.join(parts[1:-2]), parts[-2], parts[-1]
+    elif len(parts) == 3:  # Missing notes
+        req_id, desc, priority = parts
+        notes = ""
+    else:
+        return line  # Can't parse
+    
+    return f"{req_id}: Requires {desc.lower()} ({priority.lower()} priority). Notes: {notes.lower()}"
+    """Convert structured requirement to natural language sentence"""
+    sentence = f"{req['id'] + ': ' if req['id'] else ''}The system requires {req['requirement'].lower()}"
+    
+    if req['notes'] and req['notes'].lower() not in ["none", "n/a", "na"]:
+        notes = re.sub(r'[^\w\s.,!?0-9-]', '', req['notes'])
+        sentence += f". Additional notes: {notes.lower()}"
+        
+    sentence += f". This is a {req['priority'].lower()}-priority task."
+    return sentence
 
 def is_likely_task(text: str) -> bool:
     """Determine if a piece of text is likely to be a task."""
@@ -124,36 +207,58 @@ def extract_date(text: str) -> str:
 
 class RAGPipeline:
     def __init__(self):
-        # Initialize the LLM with Ollama
-        callback_manager = CallbackManager([StreamingStdOutCallbackHandler()])
+        # Initialize the LLM with Ollama using callbacks instead of callback_manager
+        callbacks = [StreamingStdOutCallbackHandler()]
         self.llm = Ollama(
             model="mistral",
-            callback_manager=callback_manager,
+            callbacks=callbacks,
             temperature=0.7
         )
         
-        # Initialize embeddings
-        self.embeddings = HuggingFaceEmbeddings()
+        # Initialize embeddings with explicit model name and clean_up_tokenization_spaces
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'clean_up_tokenization_spaces': True}
+        )
         
         # Initialize text splitter
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
+            chunk_size=2000,  # Increased from 1000 for fewer chunks
+            chunk_overlap=100,  # Reduced from 200 for less redundancy
             length_function=len,
+            separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]  # Added explicit separators
         )
         
         # Initialize or load vector store
         self.vector_store = None
+        self.cache_dir = "vector_store_cache"
+        os.makedirs(self.cache_dir, exist_ok=True)
 
     def process_text(self, text: str) -> None:
         """Process text by splitting into chunks and creating embeddings."""
         # Clean the text first
         text = clean_text(text)
+        
+        # Generate a cache key based on the text content
+        import hashlib
+        cache_key = hashlib.md5(text.encode()).hexdigest()
+        cache_path = os.path.join(self.cache_dir, f"{cache_key}.faiss")
+        
+        # Check if we have a cached version
+        if os.path.exists(cache_path):
+            print("Loading cached vector store...")
+            self.vector_store = FAISS.load_local(cache_path, self.embeddings, allow_dangerous_deserialization=True)
+            return
+            
         # Split text into chunks
         chunks = self.text_splitter.split_text(text)
         
         # Create FAISS vector store
         self.vector_store = FAISS.from_texts(chunks, self.embeddings)
+        
+        # Save to cache
+        self.vector_store.save_local(cache_path)
 
     def extract_tasks_from_text(self, text: str) -> List[Dict[str, str]]:
         """Extract tasks from text using a structured approach."""
@@ -248,68 +353,57 @@ class RAGPipeline:
         except Exception as e:
             print(f"Ollama Error: {str(e)}")
             return ""
-
+    
     def generate_tasks(self, context: str) -> List[Dict[str, str]]:
-        """Generate tasks from the provided context using a hybrid approach."""
-        # Clean the input context
-        context = clean_text(context)
+        """Generate tasks from individual requirements in the PRD."""
+        extractor = PRDExtractor()
+        requirements = extractor.extract_requirements_from_text(context)
         
-        # Step 1: Extract and validate requirements section
-        section_patterns = [
-            r'Features\s*&\s*Requirements.*?(?=\n\n|\Z)',
-            r'Features\s*and\s*Requirements.*?(?=\n\n|\Z)',
-            r'Requirements.*?(?=\n\n|\Z)',
-            r'Technical\s*Requirements.*?(?=\n\n|\Z)'
-        ]
-        
-        requirements_text = ""
-        for pattern in section_patterns:
-            match = re.search(pattern, context, re.IGNORECASE | re.DOTALL)
-            if match:
-                requirements_text = match.group(0)
-                break
-        
-        if not requirements_text:
-            print("Warning: No Features & Requirements section found in the text")
+        if isinstance(requirements, str):
+            print(f"Warning: {requirements}")
             return []
+            
+        tasks = []
+        for req in requirements:
+            # Format the requirement into a sentence
+            formatted_req = format_requirement_to_sentence(req)
+            
+            # Extract technical values for this requirement
+            technical_values = self.extract_technical_values(formatted_req)
+            
+            # Create a focused prompt for this specific requirement
+            prompt = f"""<s>[INST] You are a hardware product manager. Given this specific requirement, generate a JSON task that captures its scope. The JSON should include:
+- title: A concise summary of this specific requirement
+- description: 1-2 sentences describing what needs to be done
+- tasks: A list of 3-5 specific, actionable subtasks
+- acceptance_criteria: A list of 3-5 measurable criteria for this specific requirement
+- priority: Use the requirement's priority (High/Medium/Low)
+- assignee: Hardware Engineer for hardware requirements, Software Engineer for software/firmware
+- secondary_assignees: ["QA Engineer", "Documentation Engineer"]
+- due_date: TBD
 
-        # Step 2: Extract technical values
-        technical_values = self.extract_technical_values(requirements_text)
-        
-        # Step 3: Use FAISS to find similar requirements and their implementations
-        if self.vector_store:
-            similar_chunks = self.search_similar_chunks(requirements_text, k=2)
-            similar_context = "\nSimilar Requirements Found:\n" + "\n".join(similar_chunks)
-        else:
-            similar_context = ""
-
-        # Create a more focused prompt for Mistral
-        prompt = f"""<s>[INST] You are a technical product manager. Convert the following requirement into a structured task:
-
-Input Requirement:
-{requirements_text}
+Requirement: {formatted_req}
 
 Technical Values Found:
 {json.dumps(technical_values, indent=2)}
-{similar_context}
 
 Example of good task breakdown:
-Input: "14 Digital I/O Pins, 6 with PWM support"
+Input: "HW1: The system requires 14 digital io pins. Out of these, 6 should support pwm. This is a high-priority task."
 Output:
 {{
     "title": "Implement 14 Digital I/O Pins with 6 PWM Support",
-    "description": "Design and implement 14 digital I/O pins, ensuring 6 support PWM functionality. Must meet all technical specifications.",
+    "description": "Design and implement 14 digital I/O pins, ensuring 6 of them support PWM functionality. Must meet all technical specifications.",
     "tasks": [
-        "Design pin layout for 14 digital I/O pins",
-        "Configure 6 pins for PWM support",
-        "Test PWM functionality",
-        "Document specifications"
+        "Design pin layout for all 14 digital I/O pins",
+        "Configure 6 specific pins for PWM support",
+        "Test PWM functionality on the configured pins",
+        "Document pin specifications and PWM capabilities"
     ],
     "acceptance_criteria": [
-        "All 14 pins functional",
-        "6 pins support PWM",
-        "PWM frequency meets specs",
-        "Documentation complete"
+        "All 14 digital I/O pins are functional",
+        "6 pins successfully support PWM functionality",
+        "PWM frequency and duty cycle meet specifications",
+        "Documentation complete with pin assignments and PWM capabilities"
     ],
     "priority": "High",
     "assignee": "Hardware Engineer",
@@ -317,72 +411,43 @@ Output:
     "due_date": "TBD"
 }}
 
+Important Guidelines:
+1. When dealing with technical specifications:
+   - If a requirement mentions "X components", it means X total components, not component number X
+   - If a requirement mentions "Y should support [feature]", it means Y out of the total components should have that feature
+2. Always verify:
+   - Total quantity of components
+   - Number of components with special features
+   - Any specific technical requirements or constraints
+3. Ensure tasks and acceptance criteria:
+   - Address all components and their quantities
+   - Verify all special features and capabilities
+   - Include proper testing and documentation requirements
+
 Now, convert the requirement into a similar task structure. Focus on one step at a time:
-1. First, identify the key components
-2. Then, extract technical values
-3. Next, create specific tasks
-4. Finally, define acceptance criteria
+1. First, identify the key components and their quantities
+2. Then, extract technical values and their relationships
+3. Next, create specific tasks that address all requirements
+4. Finally, define acceptance criteria that verify all specifications
 
-Output only valid JSON that can be parsed by json.loads() [/INST]</s>"""
+Output only valid JSON that can be parsed by json.loads(). Do not include any other text or comments. [/INST]</s>"""
 
-        # Generate tasks using Ollama
-        generated_text = self.generate_with_api(prompt)
+            # Generate task using Ollama
+            generated_text = self.generate_with_api(prompt)
+            
+            # Extract JSON from the generated text
+            try:
+                json_match = re.search(r'\{[\s\S]*\}', generated_text, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(0)
+                    task_json = json.loads(json_str)
+                    tasks.append(task_json)
+            except json.JSONDecodeError as e:
+                print(f"Error parsing JSON for requirement {req.get('id', 'unknown')}: {str(e)}")
+            except Exception as e:
+                print(f"Error processing requirement {req.get('id', 'unknown')}: {str(e)}")
         
-        print("\nDebug - Mistral Generated Output:")
-        print("="*80)
-        print(generated_text)
-        print("="*80)
-        
-        # Extract JSON from the generated text
-        try:
-            # Find JSON-like structure in the text
-            json_match = re.search(r'\{[\s\S]*\}', generated_text, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(0)
-                print("\nDebug - Extracted JSON string:")
-                print(json_str)
-                print("="*80)
-                
-                # Try to parse the JSON
-                task_json = json.loads(json_str)
-                return [task_json]
-        except json.JSONDecodeError as e:
-            print(f"\nDebug - JSON Decode Error: {str(e)}")
-        except Exception as e:
-            print(f"\nDebug - Unexpected error: {str(e)}")
-        
-        # If JSON parsing fails, create a structured task from the text
-        requirement_lines = requirements_text.split('\n')
-        if len(requirement_lines) >= 2:
-            requirement_content = requirement_lines[1]  # Get the actual requirement line
-            fields = requirement_content.split('\t')
-            if len(fields) >= 4:
-                req_id, req_text, priority, notes = fields
-                
-                # Create a detailed task based on the requirement
-                task = {
-                    'title': f"Define and Validate {req_text}",
-                    'description': f"Design and validate the configuration to provide {req_text}, with {notes}",
-                    'tasks': [
-                        f"Select and configure components for {req_text}",
-                        f"Implement {notes} functionality",
-                        f"Verify {notes} through testing and validation",
-                        "Create technical documentation with specifications"
-                    ],
-                    'acceptance_criteria': [
-                        f"All {req_text} are functional and meet specifications",
-                        f"{notes} functionality verified and tested",
-                        "Passes all technical validation tests",
-                        "Documentation complete with all specifications"
-                    ],
-                    'priority': priority,
-                    'assignee': 'Hardware Engineer (Lead)',
-                    'secondary_assignees': ['Embedded Systems Engineer', 'QA Engineer'],
-                    'due_date': 'TBD'
-                }
-                return [task]
-        
-        return []
+        return tasks
 
     def search_similar_chunks(self, query: str, k: int = 3) -> List[str]:
         """Search for similar chunks in the vector store."""
