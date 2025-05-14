@@ -1,11 +1,11 @@
 #test pdf processor that splitting is occuring correctly
 
 from pdf_processor import extract_text
+from pathlib import Path
 
 def main():
-    # Replace 'path_to_your_pdf.pdf' with the actual path to your PDF file
-    pdf_path = "/Users/edwinguzman/Downloads/test1_SPECIFICATION_DOCUMENT.pdf"  # You'll need to put your PDF in this location
-    
+    # Get path to PDF in Documents/PRDs folder
+    pdf_path = str(Path.home() / "Documents" / "PRDs" / "MOCK-PRD-Arduino-Uno.pdf")
     # Extract text from the PDF
     extracted_text = extract_text(pdf_path)
     
