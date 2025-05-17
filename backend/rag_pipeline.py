@@ -5,6 +5,10 @@ from typing import List, Dict, Any
 import json
 import re
 import os
+import asyncio
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from langchain_text_splitters.character import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -12,56 +16,14 @@ from langchain_community.llms import Ollama
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
 import requests
 import torch
+from extractors.prd_extractor import PRDExtractor
 
-#this class is used to extract requirements from a text file
-class PRDExtractor:
-    def __init__(self):
-        self.section_patterns = [
-            r'\d+\.\d+\s*Hardware\s*Requirements',
-            r'\d+\.\d+\s*Software\s*Requirements',
-            r'Technical\s*Requirements'
-        ]
-        self.requirement_patterns = [
-            r'^(?P<id>[A-Z]{2}\d+)\s+(?P<req>.+?)\s+(?P<pri>High|Medium|Low)\s+(?P<notes>.+)$',
-            r'^-\s*(?P<req>.+?)\s*:\s*(?P<notes>.+)$',
-            r'^(?:The system shall|Must|Should)\s+(?P<req>.+?)(?:\s*\((?P<notes>.+)\))?$'
-        ]
-
-    def extract_requirements_from_text(self, text: str) -> List[Dict[str, str]]:
-        """Extract requirements from text using the defined patterns.
-        
-        Args:
-            text: The text to extract requirements from
-            
-        Returns:
-            List of dictionaries containing requirement information
-        """
-        requirements = []
-        
-        # Split text into lines
-        lines = text.split('\n')
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-                
-            # Try each pattern
-            for pattern in self.requirement_patterns:
-                match = re.match(pattern, line)
-                if match:
-                    req_dict = match.groupdict()
-                    # Ensure all required fields are present
-                    if 'id' not in req_dict:
-                        req_dict['id'] = ''
-                    if 'priority' not in req_dict:
-                        req_dict['priority'] = 'Medium'
-                    if 'notes' not in req_dict:
-                        req_dict['notes'] = ''
-                    requirements.append(req_dict)
-                    break
-        
-        return requirements
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 def clean_text(text: str) -> str:
     """Clean text by removing extra whitespace and newlines while preserving tabs."""
@@ -73,38 +35,46 @@ def clean_text(text: str) -> str:
     text = re.sub(r'[^\w\s.,!?\t-]', '', text)
     return text.strip()
 
-def format_requirement_to_sentence(req: Dict[str, str]) -> str:
+def format_requirement_to_sentence(requirement: Dict[str, str]) -> str:
     """Convert structured requirement to natural language sentence.
     
     Args:
-        req: Dictionary containing requirement fields (id, requirement, priority, notes)
-        
+        requirement: Dictionary containing requirement fields (id, requirement, priority, notes)
+            
     Returns:
         Formatted requirement as a natural language sentence
     """
-    # First normalize whitespace
-    line = ' '.join(line.split())
+    # Validate required dictionary keys
+    if not all(k in requirement for k in ["requirement", "priority"]):
+        print("Skipping incomplete requirement:", requirement)
+        return ""
     
-    # Handle both "HW1 Desc Priority Notes" and "ID   Requirement   Priority   Notes" formats
-    parts = re.split(r'\s{2,}|\t', line)  # Split on multiple spaces or tabs
+    # If input is a string, try to parse it
+    if isinstance(requirement, str):
+        # First normalize whitespace
+        raw_text = ' '.join(requirement.split())
+        
+        # Try to parse structured format (HW1\tDesc\tPriority\tNotes)
+        parts = re.split(r'\s{2,}|\t', raw_text)
+        
+        if len(parts) >= 4:  # Full format with tabs/spaces
+            req_id, desc, priority, notes = parts[0], ' '.join(parts[1:-2]), parts[-2], parts[-1]
+            return f"{req_id}: Requires {desc.lower()} ({priority.lower()} priority). Notes: {notes.lower()}"
+        elif len(parts) == 3:  # Missing notes
+            req_id, desc, priority = parts
+            return f"{req_id}: Requires {desc.lower()} ({priority.lower()} priority)."
+        else:
+            # If not structured format, return cleaned string
+            return clean_text(raw_text)
     
-    if len(parts) >= 4:  # Full format
-        req_id, desc, priority, notes = parts[0], ' '.join(parts[1:-2]), parts[-2], parts[-1]
-    elif len(parts) == 3:  # Missing notes
-        req_id, desc, priority = parts
-        notes = ""
-    else:
-        return line  # Can't parse
+    # If input is a dictionary, use the structured approach
+    sentence = f"{requirement['id'] + ': ' if requirement.get('id') else ''}The system requires {requirement['requirement'].lower()}"
     
-    return f"{req_id}: Requires {desc.lower()} ({priority.lower()} priority). Notes: {notes.lower()}"
-    """Convert structured requirement to natural language sentence"""
-    sentence = f"{req['id'] + ': ' if req['id'] else ''}The system requires {req['requirement'].lower()}"
-    
-    if req['notes'] and req['notes'].lower() not in ["none", "n/a", "na"]:
-        notes = re.sub(r'[^\w\s.,!?0-9-]', '', req['notes'])
+    if requirement.get('notes') and requirement['notes'].lower() not in ["none", "n/a", "na"]:
+        notes = re.sub(r'[^\w\s.,!?0-9-]', '', requirement['notes'])
         sentence += f". Additional notes: {notes.lower()}"
         
-    sentence += f". This is a {req['priority'].lower()}-priority task."
+    sentence += f". This is a {requirement['priority'].lower()}-priority task."
     return sentence
 
 def is_likely_task(text: str) -> bool:
@@ -222,36 +192,44 @@ class RAGPipeline:
             encode_kwargs={'clean_up_tokenization_spaces': True}
         )
         
-        # Initialize text splitter
+        # Initialize text splitter with optimized parameters
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=2000,  # Increased from 1000 for fewer chunks
-            chunk_overlap=100,  # Reduced from 200 for less redundancy
+            chunk_size=2000,
+            chunk_overlap=100,
             length_function=len,
-            separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]  # Added explicit separators
+            separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]
         )
         
-        # Initialize or load vector store
+        # Initialize vector store with improved caching
         self.vector_store = None
         self.cache_dir = "vector_store_cache"
         os.makedirs(self.cache_dir, exist_ok=True)
+        
+        # Initialize thread pool for parallel processing
+        self.executor = ThreadPoolExecutor(max_workers=4)
+
+    @lru_cache(maxsize=100)
+    def _get_cache_key(self, text: str) -> str:
+        """Generate a cache key for the text content."""
+        import hashlib
+        return hashlib.md5(text.encode()).hexdigest()
 
     def process_text(self, text: str) -> None:
-        """Process text by splitting into chunks and creating embeddings."""
+        """Process text by splitting into chunks and creating embeddings with improved caching."""
         # Clean the text first
         text = clean_text(text)
         
-        # Generate a cache key based on the text content
-        import hashlib
-        cache_key = hashlib.md5(text.encode()).hexdigest()
+        # Generate cache key
+        cache_key = self._get_cache_key(text)
         cache_path = os.path.join(self.cache_dir, f"{cache_key}.faiss")
         
         # Check if we have a cached version
         if os.path.exists(cache_path):
-            print("Loading cached vector store...")
+            logger.info("Loading cached vector store...")
             self.vector_store = FAISS.load_local(cache_path, self.embeddings, allow_dangerous_deserialization=True)
             return
             
-        # Split text into chunks
+        # Split text into chunks in parallel
         chunks = self.text_splitter.split_text(text)
         
         # Create FAISS vector store
@@ -345,109 +323,93 @@ class RAGPipeline:
         
         return values
 
-    def generate_with_api(self, prompt: str) -> str:
-        """Generate text using Ollama."""
+    async def generate_with_api_async(self, prompt: str) -> str:
+        """Generate text using Ollama asynchronously."""
         try:
-            response = self.llm.invoke(prompt)
+            # Run the LLM call in a thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                self.executor,
+                lambda: self.llm.invoke(prompt)
+            )
             return response
         except Exception as e:
-            print(f"Ollama Error: {str(e)}")
+            logger.error(f"Ollama Error: {str(e)}")
             return ""
-    
-    def generate_tasks(self, context: str) -> List[Dict[str, str]]:
-        """Generate tasks from individual requirements in the PRD."""
-        extractor = PRDExtractor()
-        requirements = extractor.extract_requirements_from_text(context)
-        
-        if isinstance(requirements, str):
-            print(f"Warning: {requirements}")
-            return []
-            
-        tasks = []
-        for req in requirements:
-            # Format the requirement into a sentence
-            formatted_req = format_requirement_to_sentence(req)
-            
-            # Extract technical values for this requirement
-            technical_values = self.extract_technical_values(formatted_req)
-            
-            # Create a focused prompt for this specific requirement
-            prompt = f"""<s>[INST] You are a hardware product manager. Given this specific requirement, generate a JSON task that captures its scope. The JSON should include:
-- title: A concise summary of this specific requirement
-- description: 1-2 sentences describing what needs to be done
-- tasks: A list of 3-5 specific, actionable subtasks
-- acceptance_criteria: A list of 3-5 measurable criteria for this specific requirement
-- priority: Use the requirement's priority (High/Medium/Low)
-- assignee: Hardware Engineer for hardware requirements, Software Engineer for software/firmware
-- secondary_assignees: ["QA Engineer", "Documentation Engineer"]
-- due_date: TBD
 
-Requirement: {formatted_req}
+    async def _process_single_requirement(self, requirement: Dict[str, str]) -> Dict[str, str]:
+        """Process a single requirement asynchronously."""
+        try:
+            formatted_requirement = format_requirement_to_sentence(requirement)
+            if not formatted_requirement:
+                return None
+                
+            technical_values = self.extract_technical_values(formatted_requirement)
+            prompt = self._build_task_prompt(formatted_requirement, technical_values, requirement)
+            generated_text = await self.generate_with_api_async(prompt)
+            
+            return self._parse_generated_task(generated_text)
+        except Exception as e:
+            logger.error(f"Error processing requirement: {str(e)}")
+            return None
+
+    def _build_task_prompt(self, formatted_requirement: str, technical_values: dict, requirement: Dict[str, str]) -> str:
+        """Build the prompt for task generation."""
+        return f"""You are a task generator. Convert this requirement into a structured task.
+
+Input Requirement: {formatted_requirement}
 
 Technical Values Found:
 {json.dumps(technical_values, indent=2)}
 
-Example of good task breakdown:
-Input: "HW1: The system requires 14 digital io pins. Out of these, 6 should support pwm. This is a high-priority task."
-Output:
+Generate a task with this exact JSON structure:
 {{
-    "title": "Implement 14 Digital I/O Pins with 6 PWM Support",
-    "description": "Design and implement 14 digital I/O pins, ensuring 6 of them support PWM functionality. Must meet all technical specifications.",
+    "title": "A clear, concise title for the task",
+    "description": "A detailed description of what needs to be done",
     "tasks": [
-        "Design pin layout for all 14 digital I/O pins",
-        "Configure 6 specific pins for PWM support",
-        "Test PWM functionality on the configured pins",
-        "Document pin specifications and PWM capabilities"
+        "Specific subtask 1",
+        "Specific subtask 2",
+        "Specific subtask 3"
     ],
     "acceptance_criteria": [
-        "All 14 digital I/O pins are functional",
-        "6 pins successfully support PWM functionality",
-        "PWM frequency and duty cycle meet specifications",
-        "Documentation complete with pin assignments and PWM capabilities"
+        "Measurable criterion 1",
+        "Measurable criterion 2",
+        "Measurable criterion 3"
     ],
-    "priority": "High",
-    "assignee": "Hardware Engineer",
-    "secondary_assignees": ["Embedded Systems Engineer", "QA Engineer"],
+    "priority": "{requirement.get('priority', 'Medium')}",
+    "assignee": "Hardware Engineer" if "HW" in requirement.get('id', '') else "Software Engineer",
     "due_date": "TBD"
-}}
+}}"""
 
-Important Guidelines:
-1. When dealing with technical specifications:
-   - If a requirement mentions "X components", it means X total components, not component number X
-   - If a requirement mentions "Y should support [feature]", it means Y out of the total components should have that feature
-2. Always verify:
-   - Total quantity of components
-   - Number of components with special features
-   - Any specific technical requirements or constraints
-3. Ensure tasks and acceptance criteria:
-   - Address all components and their quantities
-   - Verify all special features and capabilities
-   - Include proper testing and documentation requirements
+    def _parse_generated_task(self, generated_text: str) -> Dict[str, str]:
+        """Parse the generated task from the LLM response."""
+        try:
+            json_match = re.search(r'\{[\s\S]*\}', generated_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+                return json.loads(json_str)
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing JSON: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error processing task: {str(e)}")
+        return None
 
-Now, convert the requirement into a similar task structure. Focus on one step at a time:
-1. First, identify the key components and their quantities
-2. Then, extract technical values and their relationships
-3. Next, create specific tasks that address all requirements
-4. Finally, define acceptance criteria that verify all specifications
-
-Output only valid JSON that can be parsed by json.loads(). Do not include any other text or comments. [/INST]</s>"""
-
-            # Generate task using Ollama
-            generated_text = self.generate_with_api(prompt)
-            
-            # Extract JSON from the generated text
-            try:
-                json_match = re.search(r'\{[\s\S]*\}', generated_text, re.DOTALL)
-                if json_match:
-                    json_str = json_match.group(0)
-                    task_json = json.loads(json_str)
-                    tasks.append(task_json)
-            except json.JSONDecodeError as e:
-                print(f"Error parsing JSON for requirement {req.get('id', 'unknown')}: {str(e)}")
-            except Exception as e:
-                print(f"Error processing requirement {req.get('id', 'unknown')}: {str(e)}")
+    async def generate_tasks(self, context: str) -> List[Dict[str, str]]:
+        """Generate tasks from individual requirements in the PRD using async processing."""
+        extractor = PRDExtractor()
+        requirements = extractor.extract_requirements_from_text(context)
         
-        return tasks
+        if isinstance(requirements, str):
+            logger.warning(f"Warning: {requirements}")
+            return []
+            
+        # Process requirements concurrently
+        tasks = await asyncio.gather(
+            *[self._process_single_requirement(req) for req in requirements]
+        )
+        
+        # Filter out None results
+        return [task for task in tasks if task is not None]
 
     def search_similar_chunks(self, query: str, k: int = 3) -> List[str]:
         """Search for similar chunks in the vector store."""
@@ -456,6 +418,11 @@ Output only valid JSON that can be parsed by json.loads(). Do not include any ot
         
         docs = self.vector_store.similarity_search(query, k=k)
         return [doc.page_content for doc in docs]
+
+    def __del__(self):
+        """Cleanup thread pool on object destruction."""
+        if hasattr(self, 'executor'):
+            self.executor.shutdown(wait=True)
 
 def main():
     # Example usage
