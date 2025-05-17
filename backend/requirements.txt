@@ -13,4 +13,7 @@ sentence-transformers==3.1.1  # State-of-the-art sentence embeddings
 langchain-ollama==0.3.2  # Ollama integration for LangChain
 
 # API and HTTP
-requests==2.32.3  # HTTP library for API calls 
+requests==2.32.3  # HTTP library for API calls
+
+# Text Processing
+rapidfuzz==3.6.1  # Fast string matching and fuzzy search 
