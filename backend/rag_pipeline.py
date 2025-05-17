@@ -16,7 +16,8 @@ from langchain_community.llms import Ollama
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
 import requests
 import torch
-from extractors.prd_extractor import PRDExtractor
+from backend.extractors.prd_extractor import PRDExtractor
+from backend.examples.perfect_outputs import get_example_outputs
 
 # Configure logging
 logging.basicConfig(
@@ -355,12 +356,24 @@ class RAGPipeline:
 
     def _build_task_prompt(self, formatted_requirement: str, technical_values: dict, requirement: Dict[str, str]) -> str:
         """Build the prompt for task generation."""
+        # Get perfect examples
+        examples = get_example_outputs()
+        
+        # Determine requirement type
+        is_hardware = "HW" in requirement.get('id', '')
+        example_type = "hardware" if is_hardware else "software"
+        example = examples[example_type]
+        
         return f"""You are a task generator. Convert this requirement into a structured task.
 
 Input Requirement: {formatted_requirement}
 
 Technical Values Found:
 {json.dumps(technical_values, indent=2)}
+
+Here's an example of a perfect output for this type of requirement:
+Input: {example['input']}
+Output: {json.dumps(example['expected_output'], indent=2)}
 
 Generate a task with this exact JSON structure:
 {{
@@ -379,7 +392,9 @@ Generate a task with this exact JSON structure:
     "priority": "{requirement.get('priority', 'Medium')}",
     "assignee": "Hardware Engineer" if "HW" in requirement.get('id', '') else "Software Engineer",
     "due_date": "TBD"
-}}"""
+}}
+
+Follow the example's style and level of detail for your response."""
 
     def _parse_generated_task(self, generated_text: str) -> Dict[str, str]:
         """Parse the generated task from the LLM response."""
